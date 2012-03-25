@@ -2,8 +2,11 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <mpi.h>
+#include <pthread.h>
 
-#define SIZE 8192 
+
+#define NUMTHREADS 2
+#define SIZE 64 
 
 
 #if defined(__i386__)
@@ -186,14 +189,44 @@ double **A=NULL;
 double *B =NULL;
 double *Bholder = NULL;
 double **C=NULL;
-unsigned int matrix_size=8192;
-unsigned long rng_init_seeds[6]={0x0, 0x123, 0x234, 0x345, 0x456, 0x789};
-unsigned long rng_init_length=6;
 double clock_rate=2666700000.0; // change to 700000000.0 for Blue Gene/L
+unsigned int matrix_size=8192;
 int worldSize, myRank, aSize, sendTo;
-long long sendTotal, recvTotal, compTotal;
 int offsetting;
 int partitionSize;
+unsigned long rng_init_seeds[6]={0x0, 0x123, 0x234, 0x345, 0x456, 0x789};
+unsigned long rng_init_length=6;
+long long sendTotal, recvTotal, compTotal;
+
+
+void * multiplyRows(void * dealWithRows){
+	int compStart, compEnd, i, j, k;
+	//The row offset number that each thread will deal with	needs to be multiplied by rows/#threads to get actual offset
+	int offset = *((int *) dealWithRows);
+
+	//Calculate the matrix part
+	compStart = rdtsc();
+
+
+
+	//Each thread is only going to do part of the multiplication
+	for(i = 0; i < partitionSize/NUMTHREADS; i++){
+		for(k = 0; k < partitionSize; k++){
+			for(j = 0; j < SIZE; j++){
+				//Do the multiplication of A and part of B
+				C[i + offset*partitionSize/NUMTHREADS][k + offsetting] += A[i + offset * partitionSize / NUMTHREADS][j] * B[k*SIZE + j];
+			   }
+		} 
+
+	}
+	compEnd = rdtsc();
+	compTotal += compEnd - compStart;
+	
+	if(offset != 0){
+		pthread_exit(0);
+	}
+	return NULL;
+}
 
 
 
@@ -201,21 +234,26 @@ void multiply(){
 
 	MPI_Request sentRequests[2];
 	MPI_Request recvRequests[2];
-	int i, j, k, outCount; 
+	int i, outCount; 
 	int statusArr[2];
 	int recieved[2], sent[2];
 	int offsetHolder; 
 	int done = 0;
-	long long recvStart, sendStart, compStart, compEnd;
+	int threads;
+	long long recvStart, sendStart;
 	MPI_Status statInfo[2];
+	pthread_t threadHandler[NUMTHREADS-1];
+	int doRowOffset[NUMTHREADS];
 
-	Bholder = (double *) calloc(partitionSize * SIZE, sizeof(double));
 
 
 	while(done < worldSize){
 		//Make sure to listen before you talk
 		//Post the recieves but don't use them yet, use them after you are done computing information
 		//The tag represents the number it should be recieving, 0 for first one 1 for second which will be the first it actually recieves, 2 for the third computation
+		
+		Bholder = (double *) calloc(partitionSize * SIZE, sizeof(double));
+
 		recvStart = rdtsc();
 		MPI_Irecv(&offsetHolder, 1, MPI_INT, MPI_ANY_SOURCE, done+1, MPI_COMM_WORLD, &(recvRequests[0]));
 		MPI_Irecv(Bholder, partitionSize*SIZE, MPI_DOUBLE, MPI_ANY_SOURCE, done+1, MPI_COMM_WORLD, &(recvRequests[1]));
@@ -223,27 +261,17 @@ void multiply(){
 		
 
 		
-
-		//Calculate the matrix part
-		compStart = rdtsc();
-		for(i = 0; i < aSize; i++){
-			for(k = 0; k < partitionSize; k++){
-				//if(done == 3)
-				//	printf("%d %d %d \n",myRank, i, j );
-				for(j = 0; j < SIZE; j++){
-					//Do the multiplication of A and part of B
-					C[i][k + offsetting] += A[i][j] * B[k*SIZE + j];
-
-					if(myRank == 0)	{
-					}
-				   }
-			} 
-			if(myRank == 0){
-//				printf("next row:\n");
-			}
+		doRowOffset[0] = 0;
+		for(threads = 1; threads < NUMTHREADS; threads++){
+			doRowOffset[threads] = threads;
+			pthread_create(&threadHandler[threads-1], NULL, multiplyRows, (void *) &doRowOffset[threads]);
 		}
-		compEnd = rdtsc();
-		compTotal += compEnd - compStart;
+		//Call the calculation function for the "main" thread for this task
+		multiplyRows( &doRowOffset);
+
+		for(threads = 1; threads < NUMTHREADS; threads++){
+			pthread_join(threadHandler[threads-1], NULL);
+		}
 
 		//Check pointing done starts at 1 and goes up to n
 		/*
@@ -296,7 +324,13 @@ void multiply(){
 					offsetting = offsetHolder;
 				}else{
 					recieved[1] = 1;
+
+					//Done with previous B so free the memory
+					free(B);
+
 					B = Bholder;
+					//B now points to Bholder so we don't want to free Bholder or that will get rid of whats in B
+					Bholder = NULL;
 				}
 			}
 		}
@@ -305,6 +339,9 @@ void multiply(){
 
 
 	}
+
+	//Do the final free on B
+	free(B);
 }
 
 int main(int argc, char * argv[]){
@@ -393,8 +430,10 @@ int main(int argc, char * argv[]){
 		printf("\n\n");
 	}*/
 	finish = rdtsc();
-	
 	execTime = finish - start;
+
+
+
 	//Compute the timing information leave as cycles for now
 	
 
