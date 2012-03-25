@@ -1,2 +1,2 @@
 all: main.c
-	mpicc -Wall main.c
+	mpicc -Wall -lpthread main.c
